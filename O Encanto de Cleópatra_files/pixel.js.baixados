@@ -1,0 +1,674 @@
+(function (window, document, navigator) {
+  'use strict';
+
+  var DEFAULT_ENDPOINT = 'https://pixel.trackhunter.com.br/collect';
+
+  function getCookie(name) {
+    var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? match[2] : '';
+  }
+
+  function uuid() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return (
+      Date.now().toString(36) +
+      '-' +
+      Math.random().toString(36).slice(2, 11) +
+      Math.random().toString(36).slice(2, 11)
+    );
+  }
+
+  function getBrowserId() {
+    try {
+      var id = localStorage.getItem('th_bid');
+      if (!id) {
+        id = uuid();
+        localStorage.setItem('th_bid', id);
+      }
+      return id;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function getSessionId() {
+    try {
+      var id = sessionStorage.getItem('th_sid');
+      if (!id) {
+        id = uuid();
+        sessionStorage.setItem('th_sid', id);
+      }
+      return id;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function getDeviceType() {
+    var ua = navigator.userAgent.toLowerCase();
+    if (/ipad|tablet|(android(?!.*mobile))/.test(ua)) return 'tablet';
+    if (/mobile|android|iphone|ipod/.test(ua)) return 'mobile';
+    return 'desktop';
+  }
+
+  function getBrowserFamily() {
+    var ua = navigator.userAgent;
+    if (/Edg\//.test(ua)) return 'Edge';
+    if (/OPR\/|Opera/.test(ua)) return 'Opera';
+    if (/Chrome\//.test(ua)) return 'Chrome';
+    if (/Firefox\//.test(ua)) return 'Firefox';
+    if (/Safari\//.test(ua)) return 'Safari';
+    return 'Unknown';
+  }
+
+  function getBrowserVersion() {
+    var ua = navigator.userAgent;
+    var match =
+      ua.match(/(?:Edg|OPR|Firefox|Chrome|Version)\/([\d.]+)/) ||
+      ua.match(/Safari\/([\d.]+)/);
+    return match ? match[1] : '';
+  }
+
+  function getConnectionType() {
+    var c =
+      navigator.connection ||
+      navigator.mozConnection ||
+      navigator.webkitConnection;
+    return c && c.effectiveType ? c.effectiveType : '';
+  }
+
+  function hasTouch() {
+    return 'ontouchstart' in window || navigator.maxTouchPoints > 0 ? 1 : 0;
+  }
+
+  // Parâmetros de tracking (UTMs + click IDs) que devem sobreviver a uma
+  // troca de URL. fbp/fbc vêm de cookie, então não entram aqui.
+  var TRACKING_PARAMS = [
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'utm_src', 'utm_sck', 'src', 'sck',
+    'fbclid', 'gclid', 'gbraid'
+  ];
+  var SS_TRACKING = 'th_track';
+
+  function setCookie(name, value, days) {
+    try {
+      var d = new Date();
+      d.setTime(d.getTime() + days * 86400000);
+      document.cookie =
+        name +
+        '=' +
+        encodeURIComponent(value) +
+        ';expires=' +
+        d.toUTCString() +
+        ';path=/;SameSite=Lax';
+    } catch (e) {}
+  }
+
+  // _fbp: id de browser do Facebook. Normalmente criado pelo fbevents.js; se a
+  // página não tem o Meta Pixel, geramos e persistimos um (formato fb.1.<ts>.<rand>)
+  // pra CAPI ter o sinal. Consistente por browser via cookie.
+  function ensureFbp() {
+    var v = getCookie('_fbp');
+    if (v) return v;
+    v = 'fb.1.' + Date.now() + '.' + Math.floor(Math.random() * 1e16);
+    setCookie('_fbp', v, 90);
+    return v;
+  }
+
+  // _fbc: derivado do fbclid (fb.1.<ts>.<fbclid>). Se o cookie já existe (fbevents),
+  // usa; senão, monta a partir do fbclid da URL. Sem fbclid, retorna vazio.
+  function ensureFbc(fbclid) {
+    var v = getCookie('_fbc');
+    if (v) return v;
+    if (!fbclid) return '';
+    v = 'fb.1.' + Date.now() + '.' + fbclid;
+    setCookie('_fbc', v, 90);
+    return v;
+  }
+
+  // Captura os params de tracking da URL atual e mescla com os já guardados
+  // na sessão (URL atual tem prioridade). Retorna o conjunto acumulado.
+  function persistTracking() {
+    var params = new URLSearchParams(window.location.search);
+    var stored = {};
+    try {
+      stored = JSON.parse(sessionStorage.getItem(SS_TRACKING) || '{}') || {};
+    } catch (e) {}
+    var changed = false;
+    for (var i = 0; i < TRACKING_PARAMS.length; i++) {
+      var v = params.get(TRACKING_PARAMS[i]);
+      if (v) {
+        stored[TRACKING_PARAMS[i]] = v;
+        changed = true;
+      }
+    }
+    if (changed) {
+      try {
+        sessionStorage.setItem(SS_TRACKING, JSON.stringify(stored));
+      } catch (e) {}
+    }
+    return stored;
+  }
+
+  var SCK_STORAGE = 'th_sck';
+
+  // Garante um `sck` permanente: se a URL/sessão já trouxe um, ele vence e é
+  // persistido; senão reaproveita o já gerado (localStorage/cookie); senão gera
+  // um novo uuid. Fica disponível em `stored` p/ decorar links e no payload, e
+  // num cookie p/ o backend ler server-side.
+  function ensureSck(stored) {
+    var sck = stored.sck || stored.utm_sck;
+    if (!sck) {
+      try {
+        sck = localStorage.getItem(SCK_STORAGE) || '';
+      } catch (e) {}
+      if (!sck) sck = getCookie(SCK_STORAGE);
+      if (!sck) sck = uuid();
+    }
+    stored.sck = sck;
+    try {
+      localStorage.setItem(SCK_STORAGE, sck);
+    } catch (e) {}
+    setCookie(SCK_STORAGE, sck, 365);
+    try {
+      sessionStorage.setItem(SS_TRACKING, JSON.stringify(stored));
+    } catch (e) {}
+    return stored;
+  }
+
+  // Refs nativas guardadas antes do hook, p/ reescrever a URL sem recursão.
+  var nativePushState = window.history && window.history.pushState;
+  var nativeReplaceState = window.history && window.history.replaceState;
+
+  // Reescreve a URL atual (replaceState) p/ que sck+UTMs guardados fiquem
+  // visíveis na barra e sobrevivam a refresh/compartilhamento da URL.
+  function applyTrackingToUrl(stored) {
+    if (!nativeReplaceState) return;
+    var u;
+    try {
+      u = new URL(window.location.href);
+    } catch (e) {
+      return;
+    }
+    var changed = false;
+    for (var i = 0; i < TRACKING_PARAMS.length; i++) {
+      var k = TRACKING_PARAMS[i];
+      if (stored[k] && !u.searchParams.get(k)) {
+        u.searchParams.set(k, stored[k]);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    try {
+      nativeReplaceState.call(window.history, window.history.state, '', u.toString());
+    } catch (e) {}
+  }
+
+  function onUrlChange() {
+    applyTrackingToUrl(ensureSck(persistTracking()));
+  }
+
+  // Intercepta navegação SPA (push/replaceState) + voltar/avançar p/ reaplicar
+  // os params de tracking a cada troca de URL.
+  function hookHistory() {
+    if (!nativePushState || !nativeReplaceState) return;
+    window.history.pushState = function () {
+      var ret = nativePushState.apply(window.history, arguments);
+      onUrlChange();
+      return ret;
+    };
+    window.history.replaceState = function () {
+      var ret = nativeReplaceState.apply(window.history, arguments);
+      onUrlChange();
+      return ret;
+    };
+    window.addEventListener('popstate', onUrlChange);
+    window.addEventListener('hashchange', onUrlChange);
+  }
+
+  // Hosts de checkout das plataformas suportadas. Match por substring no
+  // hostname (cobre subdomínios: pay., checkout., go., app., seguro. etc.).
+  // Clique num link pra um desses dispara InitiateCheckout e o sck é propagado.
+  var CHECKOUT_HOSTS = [
+    'hub.la',          // Hubla
+    'kiwify.com',      // Kiwify (.com / .com.br)
+    'mycartpanda.com', // CartPanda
+    'cartpanda',       // CartPanda (domínios alternativos)
+    'kirvano.com',     // Kirvano
+    'ticto.app',       // Ticto
+    'ticto.com',       // Ticto
+    'onprofit',        // OnProfit
+    'shop.tiktok',     // TikTok Shop
+    'eduzz.com',       // Eduzz
+    'cakto.com',       // Cakto
+    'lastlink.com',    // Lastlink
+    'payt.com',        // Payt
+    'perfectpay.com',  // PerfectPay
+    'b4you.com',       // B4You
+    'hotmart.com',     // Hotmart
+    'pagtrust'         // PagTrust
+  ];
+
+  // Players de vídeo (vturb e afins) embutidos via <iframe>. Decoramos o src
+  // pra que o sck/UTMs cheguem ao player e sigam até o checkout que ele abre.
+  var PLAYER_HOSTS = ['vturb', 'converteai', 'pandavideo'];
+
+  function hostnameOf(href) {
+    try {
+      return new URL(href, window.location.href).hostname.toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function matchesAny(host, list) {
+    if (!host) return false;
+    for (var i = 0; i < list.length; i++) {
+      if (host.indexOf(list[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  function isCheckoutHost(host) {
+    return matchesAny(host, CHECKOUT_HOSTS);
+  }
+
+  // true se o link aponta pra um host diferente do atual (link externo).
+  function isExternalLink(href) {
+    var host = hostnameOf(href);
+    return !!host && host !== window.location.hostname.toLowerCase();
+  }
+
+  // Dispara InitiateCheckout no máximo uma vez por host de checkout por
+  // pageload — evita refire em múltiplos cliques, mas registra a intenção.
+  var icFired = {};
+  function fireInitiateCheckout(host) {
+    if (!host || icFired[host]) return;
+    icFired[host] = 1;
+    send('InitiateCheckout');
+  }
+
+  // Anexa os params de tracking guardados ao href, sem sobrescrever os que o
+  // link já traz. Retorna a nova URL (ou a original, se nada mudou).
+  function decorateUrl(href, stored) {
+    var u;
+    try {
+      u = new URL(href, window.location.href);
+    } catch (e) {
+      return href;
+    }
+    for (var i = 0; i < TRACKING_PARAMS.length; i++) {
+      var k = TRACKING_PARAMS[i];
+      if (stored[k] && !u.searchParams.get(k)) u.searchParams.set(k, stored[k]);
+    }
+    return u.toString();
+  }
+
+  // Seletores de botões que avançam pro checkout mas NÃO são <a href> (SPAs de
+  // funil). Clique aqui dispara InitiateCheckout antes do redirect — o
+  // sendBeacon garante a entrega mesmo saindo da página.
+  var CHECKOUT_TRIGGER_SELECTOR = '.pagtrust-funnel-next-step';
+
+  function onLinkClick(e) {
+    // Botão de avançar do funil (ex.: PagTrust): o alvo pode ser o próprio
+    // elemento ou um descendente — closest() cobre os dois.
+    var t = e.target;
+    if (t && t.closest && t.closest(CHECKOUT_TRIGGER_SELECTOR)) {
+      fireInitiateCheckout('funnel-next-step');
+    }
+    var el = e.target;
+    while (el && el.nodeName !== 'A') el = el.parentNode;
+    if (!el || !el.href || !isExternalLink(el.href)) return;
+    var newHref = decorateUrl(el.href, persistTracking());
+    if (newHref !== el.href) el.href = newHref;
+    // Link de checkout: registra a intenção de compra (e o collector guarda a
+    // identidade de browser por sck pra reidratar o Purchase na CAPI).
+    if (isCheckoutHost(hostnameOf(newHref))) {
+      fireInitiateCheckout(hostnameOf(newHref));
+    }
+  }
+
+  // Delegação no capture: pega cliques (esquerdo e meio) em qualquer <a>,
+  // inclusive os inseridos dinamicamente, antes da navegação acontecer.
+  function hookOutboundLinks() {
+    document.addEventListener('click', onLinkClick, true);
+    document.addEventListener('auxclick', onLinkClick, true);
+  }
+
+  // Decora o src de <iframe>s de checkout/player (vturb) com sck+UTMs, sem
+  // sobrescrever params já presentes. Cross-origin: só conseguimos reescrever o
+  // src (não o DOM interno), então isso só ajuda players que repassam a query.
+  function decorateIframes(stored) {
+    var frames = document.getElementsByTagName('iframe');
+    for (var i = 0; i < frames.length; i++) {
+      var src = frames[i].getAttribute('src');
+      if (!src) continue;
+      var host = hostnameOf(src);
+      if (!isCheckoutHost(host) && !matchesAny(host, PLAYER_HOSTS)) continue;
+      var nu = decorateUrl(src, stored);
+      if (nu !== src) frames[i].setAttribute('src', nu);
+    }
+  }
+
+  // vturb e checkouts costumam injetar o iframe depois do load. Reaplica a
+  // decoração quando novos nós entram no DOM (debounce via rAF/timeout).
+  function watchIframes() {
+    decorateIframes(persistTracking());
+    if (typeof MutationObserver !== 'function') return;
+    var scheduled = false;
+    var obs = new MutationObserver(function () {
+      if (scheduled) return;
+      scheduled = true;
+      var run = function () {
+        scheduled = false;
+        decorateIframes(persistTracking());
+      };
+      if (window.requestAnimationFrame) window.requestAnimationFrame(run);
+      else setTimeout(run, 200);
+    });
+    obs.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // ── Lead: dispara no submit de formulários (opt-in / captura de e-mail).
+  // Por padrão qualquer <form> conta; pule um form com data-th-ignore, ou
+  // restrinja via window.thLeadSelector (CSS selector). Dedup: 1x por página.
+  var leadFired = false;
+  function onSubmit(e) {
+    if (leadFired) return;
+    var form = e.target;
+    if (!form || form.nodeName !== 'FORM') return;
+    if (form.getAttribute('data-th-ignore') !== null) return;
+    var sel = window.thLeadSelector;
+    if (sel) {
+      try {
+        if (!form.matches(sel)) return;
+      } catch (e2) {}
+    }
+    leadFired = true;
+    send('Lead');
+  }
+  function hookLeads() {
+    if (window.thLeadEvents === false) return;
+    document.addEventListener('submit', onSubmit, true);
+  }
+
+  // ── Engajamento: marca público qualificado. Dispara o evento custom
+  // 'Engagement' ao atingir % de scroll (window.thScrollDepths, default [75])
+  // e/ou segundos na página (window.thTimeOnPage, default [30]). 1x por marco.
+  function hookEngagement() {
+    if (window.thEngagementEvents === false) return;
+    var scrollMarks = window.thScrollDepths || [75];
+    var timeMarks = window.thTimeOnPage || [30];
+    var doneScroll = {};
+    var doneTime = {};
+
+    if (scrollMarks && scrollMarks.length) {
+      var onScroll = function () {
+        var doc = document.documentElement || {};
+        var body = document.body || {};
+        var top = window.pageYOffset || doc.scrollTop || 0;
+        var max =
+          (doc.scrollHeight || body.scrollHeight || 0) -
+          (window.innerHeight || doc.clientHeight || 0);
+        var pct = max > 0 ? Math.round((top / max) * 100) : 100;
+        for (var i = 0; i < scrollMarks.length; i++) {
+          var m = scrollMarks[i];
+          if (pct >= m && !doneScroll[m]) {
+            doneScroll[m] = 1;
+            send('Engagement', { kind: 'scroll', value: m });
+          }
+        }
+      };
+      try {
+        window.addEventListener('scroll', onScroll, { passive: true });
+      } catch (e3) {
+        window.addEventListener('scroll', onScroll, false);
+      }
+      onScroll();
+    }
+
+    for (var j = 0; j < timeMarks.length; j++) {
+      (function (secs) {
+        setTimeout(function () {
+          if (doneTime[secs]) return;
+          doneTime[secs] = 1;
+          send('Engagement', { kind: 'time', seconds: secs });
+        }, secs * 1000);
+      })(timeMarks[j]);
+    }
+  }
+
+  // ── Vídeo (VSL): dispara ViewContent no play e VideoProgress nos marcos de %
+  // assistido (window.thVideoMilestones, default [50]). Cobre o smartplayer
+  // vturb/converteai (web component que renderiza um <video> na própria página,
+  // inclusive em shadow DOM aberto) e, como fallback, players em <iframe> que
+  // postam mensagens de play/progresso. Best-effort: players cross-origin sem
+  // postMessage não são detectáveis. Desligue com window.thVideoEvents = false.
+  function hookVideo() {
+    if (window.thVideoEvents === false) return;
+    var milestones = window.thVideoMilestones || [50];
+    var viewFired = false;
+    var donePct = {};
+    var BOUND = '__thVid';
+
+    function fireView() {
+      if (viewFired) return;
+      viewFired = true;
+      send('ViewContent');
+    }
+    function fireProgress(pct) {
+      for (var i = 0; i < milestones.length; i++) {
+        var m = milestones[i];
+        if (pct >= m && !donePct[m]) {
+          donePct[m] = 1;
+          send('VideoProgress', { percent: m });
+        }
+      }
+    }
+
+    function onTimeUpdate(ev) {
+      var t = ev.target;
+      if (t && t.duration > 0) {
+        fireProgress(Math.round((t.currentTime / t.duration) * 100));
+      }
+    }
+    function bindVideos(root) {
+      var vids;
+      try {
+        vids = root.querySelectorAll('video');
+      } catch (e) {
+        return;
+      }
+      for (var i = 0; i < vids.length; i++) {
+        var v = vids[i];
+        if (v[BOUND]) continue;
+        v[BOUND] = 1;
+        v.addEventListener('play', fireView, true);
+        v.addEventListener('playing', fireView, true);
+        v.addEventListener('timeupdate', onTimeUpdate, true);
+      }
+    }
+    function scanShadow(root) {
+      var all;
+      try {
+        all = root.querySelectorAll('*');
+      } catch (e) {
+        return;
+      }
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) {
+          bindVideos(all[i].shadowRoot);
+          scanShadow(all[i].shadowRoot);
+        }
+      }
+    }
+    function rescan() {
+      bindVideos(document);
+      scanShadow(document);
+    }
+    rescan();
+
+    if (typeof MutationObserver === 'function') {
+      var scheduled = false;
+      var obs = new MutationObserver(function () {
+        if (scheduled) return;
+        scheduled = true;
+        var run = function () {
+          scheduled = false;
+          rescan();
+        };
+        if (window.requestAnimationFrame) window.requestAnimationFrame(run);
+        else setTimeout(run, 300);
+      });
+      obs.observe(document.documentElement || document.body, {
+        childList: true,
+        subtree: true
+      });
+    }
+
+    // Fallback: mensagens de players em <iframe> (origem de host de player).
+    window.addEventListener('message', function (e) {
+      var host = '';
+      try {
+        host = new URL(e.origin).hostname.toLowerCase();
+      } catch (err) {}
+      if (!matchesAny(host, PLAYER_HOSTS)) return;
+      var str = typeof e.data === 'string' ? e.data : '';
+      if (!str && e.data && typeof e.data === 'object') {
+        try {
+          str = JSON.stringify(e.data);
+        } catch (e2) {}
+      }
+      if (/play|playing|start/i.test(str)) fireView();
+      var pm = str.match(/(?:percent|progress|played)["':\s]+(\d{1,3})/i);
+      if (pm) fireProgress(parseInt(pm[1], 10));
+    });
+  }
+
+  function buildPayload(eventType, customData) {
+    var params = new URLSearchParams(window.location.search);
+    var stored = persistTracking();
+    // Lê da URL; se faltar (ex.: navegação que limpou a query), cai no que
+    // foi guardado na sessão.
+    function p(name) {
+      return params.get(name) || stored[name] || '';
+    }
+
+    var payload = {
+      eventId: uuid(),
+      eventType: eventType,
+      pixelId: window.thPixelId || '',
+      timestamp: Date.now(),
+      session: {
+        browserId: getBrowserId(),
+        sessionId: getSessionId()
+      },
+      page: {
+        url: window.location.href,
+        title: document.title || '',
+        referrer: document.referrer || '',
+        queryParams: window.location.search || ''
+      },
+      utm: {
+        source: p('utm_source'),
+        medium: p('utm_medium'),
+        campaign: p('utm_campaign'),
+        term: p('utm_term'),
+        content: p('utm_content'),
+        src: p('utm_src') || p('src'),
+        sck: p('utm_sck') || p('sck')
+      },
+      ads: {
+        fbclid: p('fbclid'),
+        fbp: ensureFbp(),
+        fbc: ensureFbc(p('fbclid')),
+        gclid: p('gclid'),
+        gbraid: p('gbraid')
+      },
+      device: {
+        type: getDeviceType(),
+        browserFamily: getBrowserFamily(),
+        browserVersion: getBrowserVersion(),
+        connectionType: getConnectionType(),
+        hasTouchCapability: hasTouch()
+      }
+    };
+
+    if (customData && typeof customData === 'object') {
+      payload.custom = customData;
+    }
+
+    return payload;
+  }
+
+  function endpoint() {
+    return window.thEndpoint || DEFAULT_ENDPOINT;
+  }
+
+  function send(eventType, customData) {
+    if (!window.thPixelId) {
+      if (window.console) console.warn('[trackhunter] window.thPixelId ausente — evento ignorado');
+      return;
+    }
+
+    var body = JSON.stringify(buildPayload(eventType, customData));
+
+    if (navigator.sendBeacon) {
+      try {
+        var blob = new Blob([body], { type: 'application/json' });
+        if (navigator.sendBeacon(endpoint(), blob)) return;
+      } catch (e) {
+      }
+    }
+
+    if (window.fetch) {
+      fetch(endpoint(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        keepalive: true,
+        mode: 'cors'
+      })['catch'](function () {});
+    }
+  }
+
+  function handle(args) {
+    var cmd = args[0];
+    if (cmd === 'track') {
+      send(args[1] || 'PageView', args[2]);
+    } else if (cmd === 'init') {
+      window.thPixelId = args[1];
+    } else if (window.console) {
+      console.warn('[trackhunter] comando desconhecido:', cmd);
+    }
+  }
+
+  var queued = window.th && window.th.q ? window.th.q : [];
+
+  window.th = function () {
+    handle(arguments);
+  };
+
+  for (var i = 0; i < queued.length; i++) {
+    handle(queued[i]);
+  }
+
+  // Captura/garante os params de tracking, reflete na URL atual e propaga
+  // pros links de checkout e iframes de player.
+  hookHistory();
+  applyTrackingToUrl(ensureSck(persistTracking()));
+  hookOutboundLinks();
+  watchIframes();
+  hookLeads();
+  hookEngagement();
+  hookVideo();
+
+  if (window.thAutoPageView !== false) {
+    send('PageView');
+  }
+})(window, document, navigator);
